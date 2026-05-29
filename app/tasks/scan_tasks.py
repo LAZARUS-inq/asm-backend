@@ -176,13 +176,16 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
     cmd = [
         "nuclei",
         "-u", f"https://{fqdn}",
+        "-t", "/nuclei-templates/http/vulnerabilities",
+        "-t", "/nuclei-templates/http/exposures",
+        "-t", "/nuclei-templates/http/misconfiguration",
         "-severity", "low,medium,high,critical",
         "-json-export", "-",
         "-silent",
-        "-timeout", "30",
-        "-rate-limit", "10",
-        "-bulk-size", "10",
-        "-concurrency", "10",
+        "-timeout", "10",
+        "-rate-limit", "50",
+        "-bulk-size", "25",
+        "-concurrency", "25",
         "-duc",
     ]
     if templates_dir:
