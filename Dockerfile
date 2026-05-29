@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     wget \
     unzip \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -q https://github.com/projectdiscovery/subfinder/releases/download/v2.6.6/subfinder_2.6.6_linux_amd64.zip \
@@ -19,12 +20,8 @@ RUN wget -q https://github.com/projectdiscovery/nuclei/releases/download/v3.2.4/
     && mv nuclei /usr/local/bin/ \
     && rm nuclei_3.2.4_linux_amd64.zip
 
-RUN nuclei -update-templates -duc -ud /nuclei-templates || true \
-    && ls /nuclei-templates/ 2>/dev/null | head -5 || echo "templates downloaded to default path"
-
-RUN mkdir -p /nuclei-templates && \
-    nuclei -update-templates -duc -template-path /nuclei-templates || \
-    nuclei -update-templates -duc || true
+RUN git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git /nuclei-templates \
+    && echo "Templates cloned: $(ls /nuclei-templates | wc -l) dirs"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
