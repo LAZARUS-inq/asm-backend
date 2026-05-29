@@ -163,22 +163,36 @@ def _run_port_scan(fqdn: str) -> list[dict]:
 
 def _run_vuln_scan(fqdn: str) -> list[dict]:
     logger.info(f"[nuclei] scanning {fqdn}")
+    import os
+    # Find templates dir
+    templates_dir = None
+    for path in ["/root/nuclei-templates", "/home/nuclei-templates", os.path.expanduser("~/nuclei-templates")]:
+        if os.path.isdir(path):
+            templates_dir = path
+            break
+
+    if templates_dir:
+        logger.info(f"[nuclei] using templates from {templates_dir}")
+    else:
+        logger.warning("[nuclei] templates dir not found, nuclei will try to download")
+
+    cmd = [
+        "nuclei",
+        "-u", f"https://{fqdn}",
+        "-severity", "low,medium,high,critical",
+        "-json-export", "-",
+        "-silent",
+        "-timeout", "30",
+        "-rate-limit", "10",
+        "-bulk-size", "10",
+        "-concurrency", "10",
+        "-duc",
+    ]
+    if templates_dir:
+        cmd += ["-t", templates_dir]
+
     try:
-        result = subprocess.run(
-            [
-                "nuclei",
-                "-u", f"https://{fqdn}",
-                "-severity", "low,medium,high,critical",
-                "-json-export", "-",
-                "-silent",
-                "-timeout", "30",
-                "-rate-limit", "10",
-                "-bulk-size", "10",
-                "-concurrency", "10",
-                "-duc",
-            ],
-            capture_output=True, text=True, timeout=600
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         findings = []
         for line in result.stdout.strip().splitlines():
             if not line:
@@ -205,6 +219,8 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
             except json.JSONDecodeError:
                 continue
         logger.info(f"[nuclei] found {len(findings)} vulns for {fqdn}")
+        if result.stderr:
+            logger.info(f"[nuclei] stderr: {result.stderr[:500]}")
         return findings
     except subprocess.TimeoutExpired:
         logger.warning(f"[nuclei] timeout for {fqdn}")
