@@ -1,5 +1,5 @@
 """
-Scan tasks — Week 3-4: real scanner implementations.
+Scan tasks — real scanner implementations.
 subfinder → subdomain enumeration
 nmap      → port + service detection
 nuclei    → vulnerability scanning
@@ -61,10 +61,6 @@ def _save_findings(db, scan_job_id: str, results: list[dict]) -> None:
     db.commit()
 
 
-# ──────────────────────────────────────────────
-# 1. Subdomain scanner — subfinder
-# ──────────────────────────────────────────────
-
 def _run_subdomain_scan(fqdn: str) -> list[dict]:
     logger.info(f"[subfinder] scanning {fqdn}")
     try:
@@ -79,27 +75,17 @@ def _run_subdomain_scan(fqdn: str) -> list[dict]:
             try:
                 data = json.loads(line)
                 subdomain = data.get("host", "")
-                if subdomain and subdomain != fqdn:
-                    findings.append({
-                        "finding_type": "subdomain",
-                        "target": subdomain,
-                        "severity": "info",
-                        "title": f"Subdomain discovered: {subdomain}",
-                        "description": f"Active subdomain found via passive DNS enumeration.",
-                        "raw_output": line,
-                    })
             except json.JSONDecodeError:
-                # subfinder sometimes outputs plain text
                 subdomain = line.strip()
-                if subdomain and subdomain != fqdn:
-                    findings.append({
-                        "finding_type": "subdomain",
-                        "target": subdomain,
-                        "severity": "info",
-                        "title": f"Subdomain discovered: {subdomain}",
-                        "description": "Active subdomain found via passive DNS enumeration.",
-                        "raw_output": line,
-                    })
+            if subdomain and subdomain != fqdn:
+                findings.append({
+                    "finding_type": "subdomain",
+                    "target": subdomain,
+                    "severity": "info",
+                    "title": f"Subdomain discovered: {subdomain}",
+                    "description": "Active subdomain found via passive DNS enumeration.",
+                    "raw_output": line,
+                })
         logger.info(f"[subfinder] found {len(findings)} subdomains for {fqdn}")
         return findings
     except subprocess.TimeoutExpired:
@@ -113,25 +99,17 @@ def _run_subdomain_scan(fqdn: str) -> list[dict]:
         return []
 
 
-# ──────────────────────────────────────────────
-# 2. Port scanner — nmap
-# ──────────────────────────────────────────────
-
 def _run_port_scan(fqdn: str) -> list[dict]:
     logger.info(f"[nmap] scanning {fqdn}")
     try:
         result = subprocess.run(
             [
-                "nmap", "-sV",          # service version detection
-                "--open",               # only open ports
-                "-T4",                  # aggressive timing
+                "nmap", "-sV", "--open", "-T4",
                 "-p", "21,22,23,25,53,80,443,445,3306,3389,5432,6379,8080,8443,8888,9200,27017",
-                "-oX", "-",             # XML output to stdout
-                fqdn,
+                "-oX", "-", fqdn,
             ],
             capture_output=True, text=True, timeout=180
         )
-
         findings = []
         import xml.etree.ElementTree as ET
         try:
@@ -141,30 +119,23 @@ def _run_port_scan(fqdn: str) -> list[dict]:
                     state = port_el.find("state")
                     if state is None or state.get("state") != "open":
                         continue
-
                     portid = int(port_el.get("portid", 0))
                     service_el = port_el.find("service")
-                    service_name = ""
-                    product = ""
-                    version = ""
+                    service_name = service_str = ""
                     if service_el is not None:
                         service_name = service_el.get("name", "")
                         product = service_el.get("product", "")
                         version = service_el.get("version", "")
-
-                    service_str = " ".join(filter(None, [product, version])) or service_name
-
-                    # Flag dangerous services
+                        service_str = " ".join(filter(None, [product, version])) or service_name
                     severity = "info"
-                    if portid in (23, 445):           # telnet, smb
+                    if portid in (23, 445):
                         severity = "high"
-                    elif portid in (21, 3389):         # ftp, rdp
+                    elif portid in (21, 3389):
                         severity = "medium"
-                    elif portid in (6379, 27017, 9200): # redis, mongo, elasticsearch
+                    elif portid in (6379, 27017, 9200):
                         severity = "high"
-                    elif portid in (3306, 5432):        # mysql, postgres
+                    elif portid in (3306, 5432):
                         severity = "medium"
-
                     findings.append({
                         "finding_type": "open_port",
                         "target": fqdn,
@@ -177,10 +148,8 @@ def _run_port_scan(fqdn: str) -> list[dict]:
                     })
         except ET.ParseError as e:
             logger.warning(f"[nmap] XML parse error: {e}")
-
         logger.info(f"[nmap] found {len(findings)} open ports for {fqdn}")
         return findings
-
     except subprocess.TimeoutExpired:
         logger.warning(f"[nmap] timeout for {fqdn}")
         return []
@@ -192,10 +161,6 @@ def _run_port_scan(fqdn: str) -> list[dict]:
         return []
 
 
-# ──────────────────────────────────────────────
-# 3. Vulnerability scanner — nuclei
-# ──────────────────────────────────────────────
-
 def _run_vuln_scan(fqdn: str) -> list[dict]:
     logger.info(f"[nuclei] scanning {fqdn}")
     try:
@@ -204,14 +169,16 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
                 "nuclei",
                 "-u", f"https://{fqdn}",
                 "-severity", "low,medium,high,critical",
-                "-json-export", "-",    # JSON to stdout
+                "-json-export", "-",
                 "-silent",
-                "-timeout", "10",
-                "-rate-limit", "50",
+                "-timeout", "30",
+                "-rate-limit", "10",
+                "-bulk-size", "10",
+                "-concurrency", "10",
+                "-duc",
             ],
-            capture_output=True, text=True, timeout=300
+            capture_output=True, text=True, timeout=600
         )
-
         findings = []
         for line in result.stdout.strip().splitlines():
             if not line:
@@ -220,14 +187,12 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
                 data = json.loads(line)
                 severity = data.get("info", {}).get("severity", "info").lower()
                 name = data.get("info", {}).get("name", "Unknown")
-                template_id = data.get("template-id", "")
                 matched_at = data.get("matched-at", fqdn)
                 description = data.get("info", {}).get("description", "")
                 cve_id = ""
                 for tag in data.get("info", {}).get("classification", {}).get("cve-id", []):
                     cve_id = tag
                     break
-
                 findings.append({
                     "finding_type": "vuln",
                     "target": matched_at,
@@ -239,10 +204,8 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
                 })
             except json.JSONDecodeError:
                 continue
-
         logger.info(f"[nuclei] found {len(findings)} vulns for {fqdn}")
         return findings
-
     except subprocess.TimeoutExpired:
         logger.warning(f"[nuclei] timeout for {fqdn}")
         return []
@@ -253,10 +216,6 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
         logger.error(f"[nuclei] error: {e}")
         return []
 
-
-# ──────────────────────────────────────────────
-# Main scan task
-# ──────────────────────────────────────────────
 
 @shared_task(bind=True, name="app.tasks.scan_tasks.run_full_scan", max_retries=2)
 def run_full_scan(self, domain_id: str) -> dict:
@@ -275,7 +234,6 @@ def run_full_scan(self, domain_id: str) -> dict:
         db.add(job)
         db.commit()
         db.refresh(job)
-
         logger.info(f"Starting scan job {job.id} for {domain.fqdn}")
 
         try:
@@ -308,14 +266,9 @@ def run_full_scan(self, domain_id: str) -> dict:
         db.close()
 
 
-# ──────────────────────────────────────────────
-# Periodic task
-# ──────────────────────────────────────────────
-
 @shared_task(name="app.tasks.scan_tasks.schedule_due_scans")
 def schedule_due_scans() -> dict:
     from datetime import timedelta
-
     db = SessionLocal()
     try:
         now = utcnow()
