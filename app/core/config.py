@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     api_base_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:5173"
 
+    # Resend
+    resend_api_key: str = ""
+    resend_domain: str = "resend.dev"
+
     # Shodan
     shodan_api_key: str = ""
 

@@ -1,44 +1,122 @@
+import secrets
+import uuid
+from datetime import datetime, timezone, timedelta
+
+import resend
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import Column, String, DateTime
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user
-from app.core.security import create_access_token, hash_password, verify_password
-from app.db.session import get_db
+from app.core.config import settings
+from app.core.security import create_access_token
+from app.db.session import Base, get_db
 from app.models.models import User
-from app.schemas.schemas import TokenResponse, UserLogin, UserRegister, UserResponse
+from app.schemas.schemas import TokenResponse, UserResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+resend.api_key = settings.resend_api_key
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: UserRegister, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == payload.email).first():
-        raise HTTPException(status_code=400, detail="Email already registered")
 
-    user = User(
-        email=payload.email,
-        hashed_password=hash_password(payload.password),
-        full_name=payload.full_name,
-    )
-    db.add(user)
+# ──────────────────────────────────────────────
+# Magic link token storage (simple DB table)
+# ──────────────────────────────────────────────
+
+class MagicToken(Base):
+    __tablename__ = "magic_tokens"
+    token = Column(String(64), primary_key=True)
+    email = Column(String(255), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+# ──────────────────────────────────────────────
+# Endpoints
+# ──────────────────────────────────────────────
+
+@router.post("/magic-link")
+def send_magic_link(email: str, plan: str = "starter", db: Session = Depends(get_db)):
+    """Send magic link to email. Creates user if not exists."""
+    email = email.lower().strip()
+
+    # Create user if not exists
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(email=email, hashed_password="magic_link_user")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    # Create magic token
+    token = secrets.token_urlsafe(32)
+    expires_at = utcnow() + timedelta(minutes=30)
+
+    # Remove old tokens for this email
+    db.query(MagicToken).filter(MagicToken.email == email).delete()
+
+    magic = MagicToken(token=token, email=email, expires_at=expires_at)
+    db.add(magic)
     db.commit()
-    db.refresh(user)
-    return user
+
+    # Build magic link URL
+    magic_url = f"{settings.frontend_url}/verify?token={token}&plan={plan}"
+
+    # Send email via Resend
+    try:
+        resend.Emails.send({
+            "from": f"ASM Security <noreply@{settings.resend_domain}>",
+            "to": [email],
+            "subject": "Your ASM login link",
+            "html": f"""
+            <div style="font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+                <div style="margin-bottom: 32px;">
+                    <div style="width: 40px; height: 40px; background: linear-gradient(135deg, #6366F1, #EF4444); border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px;">
+                        <span style="color: white; font-size: 20px;">🛡</span>
+                    </div>
+                    <h1 style="font-size: 22px; font-weight: 700; color: #111; margin: 0 0 8px;">Sign in to ASM</h1>
+                    <p style="font-size: 15px; color: #666; margin: 0;">Click the button below to sign in. This link expires in 30 minutes.</p>
+                </div>
+                <a href="{magic_url}" style="display: inline-block; background: #6366F1; color: white; text-decoration: none; padding: 14px 28px; border-radius: 10px; font-size: 15px; font-weight: 600; margin-bottom: 24px;">
+                    Sign in to ASM →
+                </a>
+                <p style="font-size: 13px; color: #999; margin: 0;">If you didn't request this, you can safely ignore this email.</p>
+                <p style="font-size: 12px; color: #ccc; margin-top: 8px;">Link: {magic_url}</p>
+            </div>
+            """,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to send email: {str(e)}")
+
+    return {"status": "sent", "message": "Check your email for the login link"}
 
 
-@router.post("/login", response_model=TokenResponse)
-def login(payload: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
-    if not user or not verify_password(payload.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Account disabled")
+@router.post("/verify-magic-link", response_model=TokenResponse)
+def verify_magic_link(token: str, db: Session = Depends(get_db)):
+    """Verify magic link token and return JWT."""
+    magic = db.query(MagicToken).filter(MagicToken.token == token).first()
 
-    token = create_access_token({"sub": str(user.id)})
-    return TokenResponse(access_token=token)
+    if not magic:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+    if magic.expires_at < utcnow():
+        db.delete(magic)
+        db.commit()
+        raise HTTPException(status_code=400, detail="Link expired. Please request a new one.")
+
+    user = db.query(User).filter(User.email == magic.email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Delete used token
+    db.delete(magic)
+    db.commit()
+
+    access_token = create_access_token({"sub": str(user.id)})
+    return TokenResponse(access_token=access_token)
 
 
 @router.get("/me", response_model=UserResponse)
