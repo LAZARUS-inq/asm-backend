@@ -19,7 +19,8 @@ RUN wget -q https://github.com/projectdiscovery/nuclei/releases/download/v3.2.4/
     && mv nuclei /usr/local/bin/ \
     && rm nuclei_3.2.4_linux_amd64.zip
 
-RUN nuclei -update-templates -duc || true
+RUN nuclei -update-templates -duc -ud /nuclei-templates || true \
+    && ls /nuclei-templates/ 2>/dev/null | head -5 || echo "templates downloaded to default path"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

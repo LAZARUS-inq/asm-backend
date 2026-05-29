@@ -7,6 +7,7 @@ nuclei    → vulnerability scanning
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from app.db.session import SessionLocal
 from app.models.models import Domain, Finding, ScanJob, ScanStatus, Severity
 
 logger = get_task_logger(__name__)
+
+NUCLEI_TEMPLATES = "/nuclei-templates"
 
 
 def utcnow():
@@ -163,18 +166,12 @@ def _run_port_scan(fqdn: str) -> list[dict]:
 
 def _run_vuln_scan(fqdn: str) -> list[dict]:
     logger.info(f"[nuclei] scanning {fqdn}")
-    import os
-    # Find templates dir
-    templates_dir = None
-    for path in ["/root/nuclei-templates", "/home/nuclei-templates", os.path.expanduser("~/nuclei-templates")]:
-        if os.path.isdir(path):
-            templates_dir = path
-            break
 
+    templates_dir = NUCLEI_TEMPLATES if os.path.isdir(NUCLEI_TEMPLATES) else None
     if templates_dir:
         logger.info(f"[nuclei] using templates from {templates_dir}")
     else:
-        logger.warning("[nuclei] templates dir not found, nuclei will try to download")
+        logger.warning(f"[nuclei] templates dir {NUCLEI_TEMPLATES} not found, nuclei will download")
 
     cmd = [
         "nuclei",
