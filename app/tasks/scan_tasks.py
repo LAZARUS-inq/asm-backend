@@ -64,6 +64,11 @@ RISK_SCORE_MAP = {
 }
 
 
+def _set_scan_stage(db, job: ScanJob, stage: str) -> None:
+    job.current_stage = stage
+    db.commit()
+
+
 def _save_findings(db, scan_job_id: str, results: list[dict]) -> None:
     for r in results:
         sev = SEVERITY_MAP.get(r.get("severity", "info"), Severity.info)
@@ -596,35 +601,51 @@ def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[d
     soft_time_limit=settings.scan_task_soft_time_limit,
     time_limit=settings.scan_task_time_limit,
 )
-def run_full_scan(self, domain_id: str) -> dict:
+def run_full_scan(self, domain_id: str, scan_job_id: str | None = None) -> dict:
     db = SessionLocal()
     try:
         domain = db.query(Domain).filter(Domain.id == uuid.UUID(domain_id)).first()
         if not domain:
             return {"error": "domain not found"}
 
-        job = ScanJob(
-            domain_id=domain.id,
-            celery_task_id=self.request.id or "",
-            status=ScanStatus.running,
-            started_at=utcnow(),
-        )
-        db.add(job)
-        db.commit()
-        db.refresh(job)
+        if scan_job_id:
+            job = db.query(ScanJob).filter(ScanJob.id == uuid.UUID(scan_job_id)).first()
+            if not job:
+                return {"error": "scan job not found"}
+            job.status = ScanStatus.running
+            job.celery_task_id = self.request.id or job.celery_task_id
+            job.started_at = job.started_at or utcnow()
+            job.current_stage = "subfinder"
+            db.commit()
+        else:
+            job = ScanJob(
+                domain_id=domain.id,
+                celery_task_id=self.request.id or "",
+                status=ScanStatus.running,
+                current_stage="subfinder",
+                started_at=utcnow(),
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+
         logger.info(f"Starting scan job {job.id} for {domain.fqdn}")
 
         try:
+            _set_scan_stage(db, job, "subfinder")
             subdomains = _run_subdomain_scan(domain.fqdn)
             _save_findings(db, str(job.id), subdomains)
 
+            _set_scan_stage(db, job, "nmap")
             ports = _run_port_scan(domain.fqdn)
             _save_findings(db, str(job.id), ports)
 
+            _set_scan_stage(db, job, "nuclei")
             vulns = _run_vuln_scan(domain.fqdn, ports)
             _save_findings(db, str(job.id), vulns)
 
             job.status = ScanStatus.completed
+            job.current_stage = "completed"
             job.finished_at = utcnow()
             domain.last_scanned_at = utcnow()
             db.commit()
@@ -635,6 +656,7 @@ def run_full_scan(self, domain_id: str) -> dict:
 
         except Exception as exc:
             job.status = ScanStatus.failed
+            job.current_stage = "failed"
             job.error_message = str(exc)
             job.finished_at = utcnow()
             db.commit()

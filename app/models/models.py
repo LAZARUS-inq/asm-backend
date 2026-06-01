@@ -103,6 +103,7 @@ class ScanJob(Base):
     )
     celery_task_id: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[ScanStatus] = mapped_column(Enum(ScanStatus), default=ScanStatus.pending, nullable=False)
+    current_stage: Mapped[str] = mapped_column(String(64), default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

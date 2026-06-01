@@ -97,12 +97,24 @@ class ScanJobResponse(BaseModel):
     id: uuid.UUID
     domain_id: uuid.UUID
     status: ScanStatus
+    current_stage: str = ""
     error_message: str
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ScanStatusResponse(BaseModel):
+    active: bool
+    job_id: Optional[uuid.UUID] = None
+    status: Optional[ScanStatus] = None
+    current_stage: str = ""
+    findings_count: int = 0
+    fqdn: str = ""
+    started_at: Optional[datetime] = None
+    error_message: str = ""
 
 
 # ──────────────────────────────────────────────

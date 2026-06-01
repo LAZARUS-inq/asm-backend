@@ -5,8 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user
 from app.db.session import get_db
-from app.models.models import Domain, PlanTier, User, Workspace
-from app.schemas.schemas import DomainCreate, DomainResponse
+from app.models.models import Domain, Finding, PlanTier, ScanJob, ScanStatus, User, Workspace
+from app.schemas.schemas import DomainCreate, DomainResponse, ScanStatusResponse
 from app.tasks.scan_tasks import run_full_scan
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/domains", tags=["domains"])
@@ -111,8 +111,70 @@ def trigger_scan(
     if not domain:
         raise HTTPException(status_code=404, detail="Domain not found")
 
+    job = ScanJob(
+        domain_id=domain.id,
+        status=ScanStatus.pending,
+        current_stage="queued",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
     try:
-        task = run_full_scan.delay(str(domain.id))
-        return {"task_id": task.id, "status": "queued"}
+        task = run_full_scan.delay(str(domain.id), str(job.id))
+        job.celery_task_id = task.id or ""
+        db.commit()
+        return {
+            "task_id": task.id,
+            "job_id": str(job.id),
+            "status": "queued",
+            "current_stage": "queued",
+        }
     except Exception:
-        return {"task_id": None, "status": "worker_unavailable"}
+        job.status = ScanStatus.failed
+        job.current_stage = "failed"
+        job.error_message = "worker_unavailable"
+        db.commit()
+        return {"task_id": None, "job_id": str(job.id), "status": "worker_unavailable"}
+
+
+@router.get("/{domain_id}/scan/status", response_model=ScanStatusResponse)
+def get_scan_status(
+    workspace_id: str,
+    domain_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ws = _get_workspace(workspace_id, current_user, db)
+    domain = db.query(Domain).filter(
+        Domain.id == _parse_uuid(domain_id),
+        Domain.workspace_id == ws.id,
+    ).first()
+    if not domain:
+        raise HTTPException(status_code=404, detail="Domain not found")
+
+    job = (
+        db.query(ScanJob)
+        .filter(ScanJob.domain_id == domain.id)
+        .order_by(ScanJob.created_at.desc())
+        .first()
+    )
+
+    if not job:
+        return ScanStatusResponse(active=False, fqdn=domain.fqdn)
+
+    active = job.status in (ScanStatus.pending, ScanStatus.running)
+    findings_count = (
+        db.query(Finding).filter(Finding.scan_job_id == job.id).count()
+    )
+
+    return ScanStatusResponse(
+        active=active,
+        job_id=job.id,
+        status=job.status,
+        current_stage=job.current_stage or "",
+        findings_count=findings_count,
+        fqdn=domain.fqdn,
+        started_at=job.started_at,
+        error_message=job.error_message or "",
+    )
