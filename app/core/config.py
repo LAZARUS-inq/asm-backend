@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     # Scanners (seconds)
     nuclei_subprocess_timeout: int = 600
-    nuclei_request_timeout: int = 15
+    nuclei_request_timeout: int = 8
     scan_task_soft_time_limit: int = 1200
     scan_task_time_limit: int = 1260
     # "tags" = filter within NUCLEI_TAGS_ROOT; "dirs" = two web-vuln dirs

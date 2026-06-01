@@ -15,6 +15,8 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from celery import shared_task
 from celery.utils.log import get_task_logger
@@ -76,6 +78,66 @@ def _save_findings(db, scan_job_id: str, results: list[dict]) -> None:
         )
         db.add(finding)
     db.commit()
+
+
+def _http_probe(url: str, timeout: int = 10) -> tuple[bool, str]:
+    """Check if scanner can reach the target over HTTP(S)."""
+    try:
+        req = Request(
+            url,
+            method="GET",
+            headers={"User-Agent": "ASM-Scanner/1.0"},
+        )
+        with urlopen(req, timeout=timeout) as resp:
+            return True, f"HTTP {resp.status}"
+    except URLError as e:
+        return False, str(e.reason if hasattr(e, "reason") else e)
+    except Exception as e:
+        return False, str(e)
+
+
+def _filter_reachable_urls(urls: list[str]) -> tuple[list[str], list[str]]:
+    reachable: list[str] = []
+    errors: list[str] = []
+    for url in urls:
+        ok, detail = _http_probe(url)
+        if ok:
+            logger.info(f"[nuclei] target reachable {url} ({detail})")
+            reachable.append(url)
+        else:
+            msg = f"{url}: {detail}"
+            logger.warning(f"[nuclei] target unreachable — {msg}")
+            errors.append(msg)
+    return reachable, errors
+
+
+def _unreachable_finding(fqdn: str, urls: list[str], errors: list[str]) -> dict:
+    return {
+        "finding_type": "scan_error",
+        "target": fqdn,
+        "severity": "info",
+        "title": "Target unreachable from scanner",
+        "description": (
+            "The scanner could not connect to this domain. "
+            "Nuclei was skipped to avoid a long timeout. "
+            f"URLs tried: {', '.join(urls)}. Errors: {'; '.join(errors)}"
+        ),
+        "raw_output": "; ".join(errors)[:1000],
+    }
+
+
+def _count_templates_for_scan(template_args: list[str]) -> int | None:
+    try:
+        result = subprocess.run(
+            ["nuclei", "-tl", "-silent", *template_args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return len([ln for ln in result.stdout.splitlines() if ln.strip()])
+    except Exception as e:
+        logger.warning(f"[nuclei] could not list templates: {e}")
+        return None
 
 
 def _probe_tcp_ports(fqdn: str, ports: tuple[int, ...] = (80, 443)) -> set[int]:
@@ -395,36 +457,51 @@ def _run_port_scan(fqdn: str) -> list[dict]:
 def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[dict]:
     target_urls = _nuclei_target_urls(fqdn, port_findings)
     template_args = _nuclei_template_args()
+
+    reachable_urls, probe_errors = _filter_reachable_urls(target_urls)
+    if not reachable_urls:
+        logger.error(f"[nuclei] skipping scan — {fqdn} unreachable from this host")
+        return [_unreachable_finding(fqdn, target_urls, probe_errors)]
+
     logger.info(
-        f"[nuclei] scanning {fqdn} targets={target_urls} "
-        f"mode={settings.nuclei_scan_mode!r} templates={template_args[:4]!r}..."
+        f"[nuclei] scanning {fqdn} targets={reachable_urls} "
+        f"mode={settings.nuclei_scan_mode!r} tags={settings.nuclei_scan_tags!r} "
+        f"template_args={template_args!r}"
     )
 
-    root = _nuclei_templates_root()
-    if not template_args or not root:
+    if not template_args:
         logger.warning("[nuclei] no templates — run: nuclei -update-templates -ud /nuclei-templates")
         return []
 
-    tpl_count = _count_nuclei_templates(root)
-    logger.info(f"[nuclei] template root {root} ({tpl_count} yaml files)")
-    if tpl_count == 0:
-        logger.warning("[nuclei] 0 template files under /nuclei-templates")
-        return []
+    tpl_count = _count_templates_for_scan(template_args)
+    if tpl_count is not None:
+        logger.info(f"[nuclei] {tpl_count} templates selected for this scan")
+        if tpl_count > 800:
+            logger.warning(
+                f"[nuclei] {tpl_count} templates is large — set NUCLEI_SCAN_TAGS=sqli,xss,lfi,exposure"
+            )
+    elif _nuclei_templates_root():
+        logger.info(
+            f"[nuclei] template root {_nuclei_templates_root()} "
+            f"({_count_nuclei_templates(_nuclei_templates_root())} yaml files total)"
+        )
 
     cmd: list[str] = ["nuclei"]
-    for url in target_urls:
+    for url in reachable_urls:
         cmd += ["-u", url]
     cmd += template_args
     cmd += [
         "-severity", "low,medium,high,critical",
         "-jsonl",
         "-silent",
+        "-ni",
         "-ss", "template-spray",
         "-timeout", str(settings.nuclei_request_timeout),
+        "-retries", "1",
         "-rate-limit", "100",
         "-bulk-size", "25",
         "-concurrency", "25",
-        "-max-host-error", "50",
+        "-max-host-error", "30",
         "-duc",
     ]
 

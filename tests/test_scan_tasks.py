@@ -40,6 +40,41 @@ def test_parse_nuclei_jsonl_skips_banner_lines():
     assert _parse_nuclei_jsonl(stdout, "x.com") == []
 
 
+def test_unreachable_target_returns_scan_error(monkeypatch):
+    monkeypatch.setattr(
+        "app.tasks.scan_tasks._http_probe",
+        lambda url, timeout=10: (False, "connection refused"),
+    )
+    monkeypatch.setattr(
+        "app.tasks.scan_tasks._nuclei_template_args",
+        lambda: ["-t", "/nuclei-templates/http/vulnerabilities", "-tags", "sqli"],
+    )
+    from app.tasks.scan_tasks import _run_vuln_scan
+
+    findings = _run_vuln_scan("testphp.vulnweb.com", [])
+    assert len(findings) == 1
+    assert findings[0]["finding_type"] == "scan_error"
+    assert "unreachable" in findings[0]["title"].lower()
+
+
+def test_http_probe_success(monkeypatch):
+    class FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr("app.tasks.scan_tasks.urlopen", lambda req, timeout: FakeResp())
+    from app.tasks.scan_tasks import _http_probe
+
+    ok, detail = _http_probe("http://example.com")
+    assert ok is True
+    assert "200" in detail
+
+
 def test_nuclei_template_args_tags_mode(monkeypatch):
     from app.core.config import settings
 
