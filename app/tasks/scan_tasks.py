@@ -521,36 +521,59 @@ def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[d
         f"[nuclei] scanning {fqdn} targets={scan_urls} mode={nuclei_mode_log}"
     )
 
-    cmd: list[str] = ["nuclei"]
-    for url in scan_urls:
-        cmd += ["-u", url]
+    def _build_nuclei_cmd(urls: list[str], *, use_automatic: bool) -> list[str]:
+        c: list[str] = ["nuclei"]
+        for url in urls:
+            c += ["-u", url]
+        if use_automatic:
+            c += ["-ud", root, "-t", root, "-as"]
+            tags = settings.nuclei_scan_tags.strip()
+            if tags:
+                c += ["-tags", tags]
+        else:
+            c += template_args
+        c += [
+            "-severity", settings.nuclei_severity,
+            "-jsonl",
+            "-silent",
+            "-ni",
+            "-timeout", str(settings.nuclei_request_timeout),
+            "-retries", "1",
+            "-rate-limit", "100",
+            "-bulk-size", "25",
+            "-concurrency", "25",
+            "-max-host-error", "30",
+            "-duc",
+        ]
+        return c
 
-    if settings.nuclei_automatic_scan:
-        cmd += ["-t", root, "-as"]
-        tags = settings.nuclei_scan_tags.strip()
-        if tags:
-            cmd += ["-tags", tags]
-    else:
-        cmd += template_args
-
-    cmd += [
-        "-severity", settings.nuclei_severity,
-        "-jsonl",
-        "-silent",
-        "-ni",
-        "-timeout", str(settings.nuclei_request_timeout),
-        "-retries", "1",
-        "-rate-limit", "100",
-        "-bulk-size", "25",
-        "-concurrency", "25",
-        "-max-host-error", "30",
-        "-duc",
-    ]
+    use_automatic = settings.nuclei_automatic_scan
+    cmd = _build_nuclei_cmd(scan_urls, use_automatic=use_automatic)
 
     try:
         findings, stderr, timed_out = _execute_nuclei(
             cmd, fqdn, settings.nuclei_subprocess_timeout
         )
+
+        as_failed = (
+            use_automatic
+            and not findings
+            and stderr
+            and (
+                "automatic scan" in stderr.lower()
+                or "nuclei-templates" in stderr.lower()
+            )
+        )
+        if as_failed:
+            logger.warning(
+                "[nuclei] automatic scan failed — retrying with tagged templates + seed URLs"
+            )
+            fallback_urls = _expand_scan_urls(scan_urls, fqdn)
+            cmd = _build_nuclei_cmd(fallback_urls, use_automatic=False)
+            findings, stderr, timed_out = _execute_nuclei(
+                cmd, fqdn, settings.nuclei_subprocess_timeout
+            )
+
         if stderr and not findings:
             logger.warning(f"[nuclei] stderr: {stderr[:500]!r}")
         elif stderr:

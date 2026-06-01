@@ -21,8 +21,12 @@ RUN wget -q https://github.com/projectdiscovery/nuclei/releases/download/v3.2.4/
     && rm nuclei_3.2.4_linux_amd64.zip
 
 RUN git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git /nuclei-templates \
-    && echo "Templates cloned: $(find /nuclei-templates -name '*.yaml' | wc -l) yaml files"
+    && echo "Templates cloned: $(find /nuclei-templates -name '*.yaml' | wc -l) yaml files" \
+    && mkdir -p /root \
+    && ln -sfn /nuclei-templates /root/nuclei-templates
 
+# nuclei -as looks in ~/nuclei-templates (= /root/nuclei-templates when running as root)
+ENV HOME=/root
 ENV NUCLEI_TEMPLATES_DIRECTORY=/nuclei-templates
 
 COPY requirements.txt .
