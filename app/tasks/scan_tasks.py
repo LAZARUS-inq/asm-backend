@@ -121,17 +121,37 @@ def _nuclei_target_urls(fqdn: str, port_findings: list[dict] | None = None) -> l
     return ordered
 
 
+def _nuclei_templates_root() -> str | None:
+    if os.path.isdir(NUCLEI_TEMPLATES):
+        return NUCLEI_TEMPLATES
+    return None
+
+
+def _count_nuclei_templates(root: str) -> int:
+    count = 0
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith((".yaml", ".yml")):
+                count += 1
+    return count
+
+
 def _nuclei_template_args() -> list[str]:
+    root = _nuclei_templates_root()
+    if not root:
+        logger.error(f"[nuclei] template root missing: {NUCLEI_TEMPLATES}")
+        return []
+
     mode = settings.nuclei_scan_mode.strip().lower()
     if mode == "tags":
         tags = settings.nuclei_scan_tags.strip()
         if tags:
-            return ["-tags", tags]
-        mode = "dirs"
+            # -tags alone does not load templates; -t is required
+            return ["-t", root, "-tags", tags]
 
     scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
-    if not scan_dirs and os.path.isdir(NUCLEI_TEMPLATES):
-        scan_dirs = [NUCLEI_TEMPLATES]
+    if not scan_dirs:
+        scan_dirs = [root]
     args: list[str] = []
     for d in scan_dirs:
         args += ["-t", d]
@@ -285,8 +305,15 @@ def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[d
         f"mode={settings.nuclei_scan_mode!r} templates={template_args[:4]!r}..."
     )
 
-    if not template_args:
-        logger.warning("[nuclei] no templates/tags configured — install /nuclei-templates in the image")
+    root = _nuclei_templates_root()
+    if not template_args or not root:
+        logger.warning("[nuclei] no templates — run: nuclei -update-templates -ud /nuclei-templates")
+        return []
+
+    tpl_count = _count_nuclei_templates(root)
+    logger.info(f"[nuclei] template root {root} ({tpl_count} yaml files)")
+    if tpl_count == 0:
+        logger.warning("[nuclei] 0 template files under /nuclei-templates")
         return []
 
     cmd: list[str] = ["nuclei"]

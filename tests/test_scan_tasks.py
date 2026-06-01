@@ -45,6 +45,12 @@ def test_nuclei_template_args_tags_mode(monkeypatch):
 
     monkeypatch.setattr(settings, "nuclei_scan_mode", "tags")
     monkeypatch.setattr(settings, "nuclei_scan_tags", "cve,vuln")
+    monkeypatch.setattr(
+        "app.tasks.scan_tasks._nuclei_templates_root",
+        lambda: "/nuclei-templates",
+    )
     from app.tasks.scan_tasks import _nuclei_template_args
 
-    assert _nuclei_template_args() == ["-tags", "cve,vuln"]
+    assert _nuclei_template_args() == [
+        "-t", "/nuclei-templates", "-tags", "cve,vuln",
+    ]
