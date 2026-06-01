@@ -22,6 +22,13 @@ logger = get_task_logger(__name__)
 
 NUCLEI_TEMPLATES = "/nuclei-templates"
 
+# Only scan these dirs — much faster than all templates
+NUCLEI_SCAN_DIRS = [
+    "/nuclei-templates/http/vulnerabilities",
+    "/nuclei-templates/http/exposures",
+    "/nuclei-templates/http/misconfiguration",
+]
+
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -167,18 +174,22 @@ def _run_port_scan(fqdn: str) -> list[dict]:
 def _run_vuln_scan(fqdn: str) -> list[dict]:
     logger.info(f"[nuclei] scanning {fqdn}")
 
-    templates_dir = NUCLEI_TEMPLATES if os.path.isdir(NUCLEI_TEMPLATES) else None
-    if templates_dir:
-        logger.info(f"[nuclei] using templates from {templates_dir}")
-    else:
-        logger.warning(f"[nuclei] templates dir {NUCLEI_TEMPLATES} not found, nuclei will download")
+    # Use specific dirs if they exist, else fall back to full templates
+    scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
+    if not scan_dirs and os.path.isdir(NUCLEI_TEMPLATES):
+        scan_dirs = [NUCLEI_TEMPLATES]
 
-    cmd = [
-        "nuclei",
-        "-u", f"https://{fqdn}",
-        "-t", "/nuclei-templates/http/vulnerabilities",
-        "-t", "/nuclei-templates/http/exposures",
-        "-t", "/nuclei-templates/http/misconfiguration",
+    if scan_dirs:
+        logger.info(f"[nuclei] using {len(scan_dirs)} template dirs")
+    else:
+        logger.warning("[nuclei] no templates found, nuclei will try to download")
+
+    cmd = ["nuclei", "-u", f"https://{fqdn}"]
+
+    for d in scan_dirs:
+        cmd += ["-t", d]
+
+    cmd += [
         "-severity", "low,medium,high,critical",
         "-json-export", "-",
         "-silent",
@@ -188,11 +199,9 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
         "-concurrency", "25",
         "-duc",
     ]
-    if templates_dir:
-        cmd += ["-t", templates_dir]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         findings = []
         for line in result.stdout.strip().splitlines():
             if not line:
@@ -220,7 +229,7 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
                 continue
         logger.info(f"[nuclei] found {len(findings)} vulns for {fqdn}")
         if result.stderr:
-            logger.info(f"[nuclei] stderr: {result.stderr[:500]}")
+            logger.info(f"[nuclei] stderr: {result.stderr[:300]}")
         return findings
     except subprocess.TimeoutExpired:
         logger.warning(f"[nuclei] timeout for {fqdn}")
