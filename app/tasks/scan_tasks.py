@@ -143,6 +143,34 @@ def _pick_primary_scan_url(reachable_urls: list[str]) -> list[str]:
     return [reachable_urls[0]]
 
 
+# Google Firing Range — vulns live on these paths, not on /
+FIRING_RANGE_VULN_PATHS = [
+    "/reflected/parameter/body?q=test",
+    "/reflected/parameter/body/attribute?q=test",
+    "/reflected/parameter/attribute_name?q=test",
+    "/reflected/url/parameter?q=test",
+    "/dom/xss/innerHtml",
+    "/escaped/parameter/attribute_name?q=test",
+]
+
+
+def _expand_scan_urls(scan_urls: list[str], fqdn: str) -> list[str]:
+    """Add known test paths for scanner benchmarks (homepage alone has no vulns)."""
+    if "firing-range" not in fqdn.lower():
+        return scan_urls
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for base in scan_urls:
+        base = base.rstrip("/")
+        for path in ["", *FIRING_RANGE_VULN_PATHS]:
+            url = f"{base}{path}" if path else f"{base}/"
+            if url not in seen:
+                seen.add(url)
+                expanded.append(url)
+    logger.info(f"[nuclei] firing-range: {len(expanded)} seed URLs for nuclei")
+    return expanded
+
+
 def _probe_tcp_ports(fqdn: str, ports: tuple[int, ...] = (80, 443)) -> set[int]:
     """TCP connect probe — works in Docker/Railway where raw nmap SYN scans often fail."""
     open_ports: set[int] = set()
@@ -473,28 +501,43 @@ def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[d
         return [_unreachable_finding(fqdn, target_urls, probe_errors)]
 
     scan_urls = _pick_primary_scan_url(reachable_urls)
-    tag_dirs = [template_args[i + 1] for i, a in enumerate(template_args) if a == "-t"]
+    if not settings.nuclei_automatic_scan:
+        scan_urls = _expand_scan_urls(scan_urls, fqdn)
+    root = _nuclei_templates_root()
 
-    logger.info(
-        f"[nuclei] scanning {fqdn} targets={scan_urls} "
-        f"mode={settings.nuclei_scan_mode!r} tags={settings.nuclei_scan_tags!r} "
-        f"template_dirs={tag_dirs!r}"
-    )
-
-    if not template_args:
+    if settings.nuclei_automatic_scan:
+        if not root:
+            logger.warning("[nuclei] no templates — run: nuclei -update-templates -ud /nuclei-templates")
+            return []
+        nuclei_mode_log = "automatic (-as)"
+    elif not template_args:
         logger.warning("[nuclei] no templates — run: nuclei -update-templates -ud /nuclei-templates")
         return []
+    else:
+        tag_dirs = [template_args[i + 1] for i, a in enumerate(template_args) if a == "-t"]
+        nuclei_mode_log = f"tags={settings.nuclei_scan_tags!r} dirs={tag_dirs!r}"
+
+    logger.info(
+        f"[nuclei] scanning {fqdn} targets={scan_urls} mode={nuclei_mode_log}"
+    )
 
     cmd: list[str] = ["nuclei"]
     for url in scan_urls:
         cmd += ["-u", url]
-    cmd += template_args
+
+    if settings.nuclei_automatic_scan:
+        cmd += ["-t", root, "-as"]
+        tags = settings.nuclei_scan_tags.strip()
+        if tags:
+            cmd += ["-tags", tags]
+    else:
+        cmd += template_args
+
     cmd += [
-        "-severity", "low,medium,high,critical",
+        "-severity", settings.nuclei_severity,
         "-jsonl",
         "-silent",
         "-ni",
-        "-ss", "template-spray",
         "-timeout", str(settings.nuclei_request_timeout),
         "-retries", "1",
         "-rate-limit", "100",

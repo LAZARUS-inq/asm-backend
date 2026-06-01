@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     nuclei_scan_tags: str = "sqli,xss,lfi,exposure,misconfig"
     # When nmap finds nothing: "http" (faster) or "both" (http+https)
     nuclei_fallback_targets: str = "http"
+    # Discover URLs/paths on the site (needed for Firing Range, DVWA-style apps)
+    nuclei_automatic_scan: bool = True
+    nuclei_severity: str = "info,low,medium,high,critical"
 
     # App
     environment: str = "development"

@@ -112,3 +112,14 @@ def test_pick_primary_scan_url_prefers_https():
         "https://example.com",
     ])
     assert urls == ["https://example.com"]
+
+
+def test_expand_firing_range_urls():
+    from app.tasks.scan_tasks import _expand_scan_urls
+
+    urls = _expand_scan_urls(
+        ["https://public-firing-range.appspot.com"],
+        "public-firing-range.appspot.com",
+    )
+    assert len(urls) >= 5
+    assert any("reflected" in u for u in urls)
