@@ -24,6 +24,7 @@ from celery.utils.log import get_task_logger
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.models import Domain, Finding, ScanJob, ScanStatus, Severity
+from app.tasks.scan_noise import filter_finding_noise
 
 logger = get_task_logger(__name__)
 
@@ -638,10 +639,16 @@ def run_full_scan(self, domain_id: str, scan_job_id: str | None = None) -> dict:
 
             _set_scan_stage(db, job, "nmap")
             ports = _run_port_scan(domain.fqdn)
+            ports = filter_finding_noise(
+                domain.fqdn, ports, enabled=settings.scan_suppress_cdn_noise
+            )
             _save_findings(db, str(job.id), ports)
 
             _set_scan_stage(db, job, "nuclei")
             vulns = _run_vuln_scan(domain.fqdn, ports)
+            vulns = filter_finding_noise(
+                domain.fqdn, vulns, enabled=settings.scan_suppress_cdn_noise
+            )
             _save_findings(db, str(job.id), vulns)
 
             job.status = ScanStatus.completed

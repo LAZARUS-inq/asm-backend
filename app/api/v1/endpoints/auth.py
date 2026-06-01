@@ -4,15 +4,27 @@ from datetime import datetime, timezone, timedelta
 
 import resend
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Column, String, DateTime
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user
 from app.core.config import settings
-from app.core.security import create_access_token
+from app.core.security import (
+    create_access_token,
+    decode_token_allow_expired,
+    token_past_refresh_grace,
+)
 from app.db.session import Base, get_db
 from app.models.models import User
-from app.schemas.schemas import TokenResponse, UserResponse
+from app.schemas.schemas import (
+    MagicLinkRequest,
+    MagicLinkVerify,
+    TokenResponse,
+    UserResponse,
+)
+
+_bearer = HTTPBearer(auto_error=False)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -39,9 +51,17 @@ def utcnow():
 # ──────────────────────────────────────────────
 
 @router.post("/magic-link")
-def send_magic_link(email: str, plan: str = "starter", db: Session = Depends(get_db)):
+def send_magic_link(
+    email: str | None = None,
+    body: MagicLinkRequest | None = None,
+    plan: str = "starter",
+    db: Session = Depends(get_db),
+):
     """Send magic link to email. Creates user if not exists."""
-    email = email.lower().strip()
+    raw = (body.email if body else None) or email
+    if not raw:
+        raise HTTPException(status_code=400, detail="email is required")
+    email = raw.lower().strip()
 
     # Create user if not exists
     user = db.query(User).filter(User.email == email).first()
@@ -95,8 +115,16 @@ def send_magic_link(email: str, plan: str = "starter", db: Session = Depends(get
 
 
 @router.post("/verify-magic-link", response_model=TokenResponse)
-def verify_magic_link(token: str, db: Session = Depends(get_db)):
+def verify_magic_link(
+    token: str | None = None,
+    body: MagicLinkVerify | None = None,
+    db: Session = Depends(get_db),
+):
     """Verify magic link token and return JWT."""
+    raw = (body.token if body else None) or token
+    if not raw:
+        raise HTTPException(status_code=400, detail="token is required")
+    token = raw.strip()
     magic = db.query(MagicToken).filter(MagicToken.token == token).first()
 
     if not magic:
@@ -117,6 +145,33 @@ def verify_magic_link(token: str, db: Session = Depends(get_db)):
 
     access_token = create_access_token({"sub": str(user.id)})
     return TokenResponse(access_token=access_token)
+
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh_access_token(
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+):
+    """Issue a new JWT while the previous one is still within the refresh grace window."""
+    if not creds or creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    payload = decode_token_allow_expired(creds.credentials)
+    if token_past_refresh_grace(payload):
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired. Please request a new login link.",
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return TokenResponse(access_token=create_access_token({"sub": str(user.id)}))
 
 
 @router.get("/me", response_model=UserResponse)

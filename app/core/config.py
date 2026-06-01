@@ -14,7 +14,10 @@ class Settings(BaseSettings):
     # Auth
     secret_key: str
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60
+    # JWT lifetime after magic-link login (default 7 days)
+    access_token_expire_minutes: int = 10080
+    # Allow /auth/refresh for this many days after JWT exp
+    refresh_token_grace_days: int = 30
 
     # Stripe
     stripe_secret_key: str = ""
@@ -48,6 +51,8 @@ class Settings(BaseSettings):
     # Discover URLs/paths on the site (needed for Firing Range, DVWA-style apps)
     nuclei_automatic_scan: bool = True
     nuclei_severity: str = "info,low,medium,high,critical"
+    # Drop Cloudflare Workers/Pages noise (edge ports, weak cipher templates)
+    scan_suppress_cdn_noise: bool = True
 
     # App
     environment: str = "development"

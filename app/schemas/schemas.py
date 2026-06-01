@@ -34,6 +34,14 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class MagicLinkRequest(BaseModel):
+    email: EmailStr
+
+
+class MagicLinkVerify(BaseModel):
+    token: str
+
+
 class UserResponse(BaseModel):
     id: uuid.UUID
     email: str

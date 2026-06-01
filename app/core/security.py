@@ -38,3 +38,29 @@ def decode_token(token: str) -> dict:
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def decode_token_allow_expired(token: str) -> dict:
+    """Decode JWT signature without enforcing exp (used only for refresh)."""
+    try:
+        return jwt.decode(
+            token,
+            settings.secret_key,
+            algorithms=[settings.algorithm],
+            options={"verify_exp": False},
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def token_past_refresh_grace(payload: dict) -> bool:
+    exp = payload.get("exp")
+    if not exp:
+        return True
+    expired_at = datetime.fromtimestamp(exp, tz=timezone.utc)
+    grace = timedelta(days=settings.refresh_token_grace_days)
+    return datetime.now(timezone.utc) > expired_at + grace
