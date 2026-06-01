@@ -10,9 +10,10 @@ def test_nuclei_urls_http_only_when_port_80():
     assert _nuclei_target_urls("testphp.vulnweb.com", ports) == ["http://testphp.vulnweb.com"]
 
 
-def test_nuclei_urls_both_when_ports_unknown():
+def test_nuclei_urls_http_fallback_when_no_ports(monkeypatch):
+    monkeypatch.setattr("app.tasks.scan_tasks._probe_tcp_ports", lambda fqdn: set())
     urls = _nuclei_target_urls("example.com", None)
-    assert urls == ["http://example.com", "https://example.com"]
+    assert urls == ["http://example.com"]
 
 
 def test_nuclei_urls_https_when_443_open():
@@ -37,3 +38,13 @@ def test_parse_nuclei_jsonl_finding():
 def test_parse_nuclei_jsonl_skips_banner_lines():
     stdout = "some log line\nnot json\n"
     assert _parse_nuclei_jsonl(stdout, "x.com") == []
+
+
+def test_nuclei_template_args_tags_mode(monkeypatch):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "nuclei_scan_mode", "tags")
+    monkeypatch.setattr(settings, "nuclei_scan_tags", "cve,vuln")
+    from app.tasks.scan_tasks import _nuclei_template_args
+
+    assert _nuclei_template_args() == ["-tags", "cve,vuln"]

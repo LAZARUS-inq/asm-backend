@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -73,6 +75,18 @@ def _save_findings(db, scan_job_id: str, results: list[dict]) -> None:
     db.commit()
 
 
+def _probe_tcp_ports(fqdn: str, ports: tuple[int, ...] = (80, 443)) -> set[int]:
+    """TCP connect probe — works in Docker/Railway where raw nmap SYN scans often fail."""
+    open_ports: set[int] = set()
+    for port in ports:
+        try:
+            with socket.create_connection((fqdn, port), timeout=5):
+                open_ports.add(port)
+        except OSError:
+            continue
+    return open_ports
+
+
 def _nuclei_target_urls(fqdn: str, port_findings: list[dict] | None = None) -> list[str]:
     """Build nuclei -u targets from open ports; avoid HTTPS-only when only HTTP serves."""
     ports: set[int] = set()
@@ -82,13 +96,22 @@ def _nuclei_target_urls(fqdn: str, port_findings: list[dict] | None = None) -> l
             if isinstance(p, int):
                 ports.add(p)
 
-    urls: list[str] = []
-    if not ports or 80 in ports:
-        urls.append(f"http://{fqdn}")
-    if not ports or 443 in ports:
-        urls.append(f"https://{fqdn}")
+    if not ports:
+        ports = _probe_tcp_ports(fqdn)
+        if ports:
+            logger.info(f"[nuclei] tcp probe open ports for {fqdn}: {sorted(ports)}")
 
-    # Dedupe while preserving order
+    urls: list[str] = []
+    if ports:
+        if 80 in ports:
+            urls.append(f"http://{fqdn}")
+        if 443 in ports:
+            urls.append(f"https://{fqdn}")
+    elif settings.nuclei_fallback_targets.lower() == "both":
+        urls = [f"http://{fqdn}", f"https://{fqdn}"]
+    else:
+        urls = [f"http://{fqdn}"]
+
     seen: set[str] = set()
     ordered: list[str] = []
     for u in urls:
@@ -96,6 +119,23 @@ def _nuclei_target_urls(fqdn: str, port_findings: list[dict] | None = None) -> l
             seen.add(u)
             ordered.append(u)
     return ordered
+
+
+def _nuclei_template_args() -> list[str]:
+    mode = settings.nuclei_scan_mode.strip().lower()
+    if mode == "tags":
+        tags = settings.nuclei_scan_tags.strip()
+        if tags:
+            return ["-tags", tags]
+        mode = "dirs"
+
+    scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
+    if not scan_dirs and os.path.isdir(NUCLEI_TEMPLATES):
+        scan_dirs = [NUCLEI_TEMPLATES]
+    args: list[str] = []
+    for d in scan_dirs:
+        args += ["-t", d]
+    return args
 
 
 def _parse_nuclei_jsonl(stdout: str, default_target: str) -> list[dict]:
@@ -177,7 +217,8 @@ def _run_port_scan(fqdn: str) -> list[dict]:
     try:
         result = subprocess.run(
             [
-                "nmap", "-sV", "--open", "-T4",
+                # -sT -Pn: TCP connect + skip ping — required in most cloud containers
+                "nmap", "-sT", "-Pn", "-sV", "--open", "-T4",
                 "-p", "21,22,23,25,53,80,443,445,3306,3389,5432,6379,8080,8443,8888,9200,27017",
                 "-oX", "-", fqdn,
             ],
@@ -221,6 +262,8 @@ def _run_port_scan(fqdn: str) -> list[dict]:
                     })
         except ET.ParseError as e:
             logger.warning(f"[nmap] XML parse error: {e}")
+        if not findings and result.stderr:
+            logger.warning(f"[nmap] 0 ports for {fqdn}; stderr={result.stderr[:400]!r}")
         logger.info(f"[nmap] found {len(findings)} open ports for {fqdn}")
         return findings
     except subprocess.TimeoutExpired:
@@ -236,58 +279,69 @@ def _run_port_scan(fqdn: str) -> list[dict]:
 
 def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[dict]:
     target_urls = _nuclei_target_urls(fqdn, port_findings)
-    logger.info(f"[nuclei] scanning {fqdn} targets={target_urls}")
+    template_args = _nuclei_template_args()
+    logger.info(
+        f"[nuclei] scanning {fqdn} targets={target_urls} "
+        f"mode={settings.nuclei_scan_mode!r} templates={template_args[:4]!r}..."
+    )
 
-    scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
-    if not scan_dirs and os.path.isdir(NUCLEI_TEMPLATES):
-        scan_dirs = [NUCLEI_TEMPLATES]
-
-    if scan_dirs:
-        logger.info(f"[nuclei] using {len(scan_dirs)} template dirs")
-    else:
-        logger.warning("[nuclei] no templates found — install /nuclei-templates in the image")
+    if not template_args:
+        logger.warning("[nuclei] no templates/tags configured — install /nuclei-templates in the image")
+        return []
 
     cmd: list[str] = ["nuclei"]
     for url in target_urls:
         cmd += ["-u", url]
-    for d in scan_dirs:
-        cmd += ["-t", d]
-
+    cmd += template_args
     cmd += [
         "-severity", "low,medium,high,critical",
-        "-jsonl",  # JSON Lines on stdout (required for parsing)
+        "-jsonl",
         "-silent",
         "-timeout", str(settings.nuclei_request_timeout),
-        "-rate-limit", "50",
+        "-rate-limit", "80",
         "-bulk-size", "25",
         "-concurrency", "25",
         "-max-host-error", "50",
         "-duc",
     ]
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=settings.nuclei_subprocess_timeout,
-        )
-        findings = _parse_nuclei_jsonl(result.stdout, fqdn)
+    findings: list[dict] = []
+    deadline = time.monotonic() + settings.nuclei_subprocess_timeout
 
-        if result.returncode not in (0, None) and not findings:
-            logger.warning(
-                f"[nuclei] exit={result.returncode} no findings; stderr={result.stderr[:500]!r}"
-            )
-        elif result.stderr:
-            logger.info(f"[nuclei] stderr: {result.stderr[:300]}")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if time.monotonic() > deadline:
+                logger.warning(
+                    f"[nuclei] subprocess timeout ({settings.nuclei_subprocess_timeout}s) "
+                    f"for {fqdn} — keeping {len(findings)} findings so far"
+                )
+                proc.kill()
+                break
+            line = line.strip()
+            if line.startswith("{"):
+                findings.extend(_parse_nuclei_jsonl(line, fqdn))
+
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+        stderr = (proc.stderr.read() if proc.stderr else "") or ""
+        if proc.returncode not in (0, None) and not findings and stderr:
+            logger.warning(f"[nuclei] exit={proc.returncode} no findings; stderr={stderr[:500]!r}")
+        elif stderr:
+            logger.info(f"[nuclei] stderr: {stderr[:300]}")
 
         logger.info(f"[nuclei] found {len(findings)} vulns for {fqdn}")
         return findings
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            f"[nuclei] subprocess timeout ({settings.nuclei_subprocess_timeout}s) for {fqdn}"
-        )
-        return []
     except FileNotFoundError:
         logger.error("[nuclei] not installed or not in PATH")
         return []
