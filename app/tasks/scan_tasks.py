@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,13 +27,14 @@ logger = get_task_logger(__name__)
 
 NUCLEI_TEMPLATES = "/nuclei-templates"
 
-# Subset of templates — faster than scanning all of /nuclei-templates
+# Default dirs when NUCLEI_SCAN_MODE=dirs (2 dirs ≈ minutes, not hours)
 NUCLEI_SCAN_DIRS = [
     "/nuclei-templates/http/vulnerabilities",
     "/nuclei-templates/http/exposures",
-    "/nuclei-templates/http/misconfiguration",
-    "/nuclei-templates/http/cves",
 ]
+
+# Narrow root for tags mode — do not scan all 13k templates
+NUCLEI_TAGS_ROOT = "/nuclei-templates/http/vulnerabilities"
 
 
 def utcnow():
@@ -145,9 +148,9 @@ def _nuclei_template_args() -> list[str]:
     mode = settings.nuclei_scan_mode.strip().lower()
     if mode == "tags":
         tags = settings.nuclei_scan_tags.strip()
+        tag_root = NUCLEI_TAGS_ROOT if os.path.isdir(NUCLEI_TAGS_ROOT) else root
         if tags:
-            # -tags alone does not load templates; -t is required
-            return ["-t", root, "-tags", tags]
+            return ["-t", tag_root, "-tags", tags]
 
     scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
     if not scan_dirs:
@@ -156,6 +159,98 @@ def _nuclei_template_args() -> list[str]:
     for d in scan_dirs:
         args += ["-t", d]
     return args
+
+
+def _execute_nuclei(cmd: list[str], fqdn: str, timeout_sec: int) -> tuple[list[dict], str, bool]:
+    """
+    Run nuclei with a wall-clock timeout.
+    Reading stdout line-by-line blocks when nuclei is silent; use a reader thread
+    and poll the queue so we can kill the process on time.
+    """
+    findings: list[dict] = []
+    deadline = time.monotonic() + timeout_sec
+    line_queue: queue.Queue[str | None] = queue.Queue()
+    stderr_chunks: list[str] = []
+    timed_out = False
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    def read_stdout() -> None:
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    def read_stderr() -> None:
+        try:
+            if proc.stderr is None:
+                return
+            stderr_chunks.append(proc.stderr.read())
+        except Exception:
+            pass
+
+    threading.Thread(target=read_stdout, daemon=True).start()
+    threading.Thread(target=read_stderr, daemon=True).start()
+
+    last_progress = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now > deadline:
+            timed_out = True
+            proc.kill()
+            logger.warning(
+                f"[nuclei] timeout ({timeout_sec}s) for {fqdn} — "
+                f"keeping {len(findings)} findings"
+            )
+            break
+
+        if now - last_progress >= 60:
+            logger.info(
+                f"[nuclei] still running for {fqdn} "
+                f"({int(now - (deadline - timeout_sec))}s elapsed, "
+                f"{len(findings)} findings so far)"
+            )
+            last_progress = now
+
+        try:
+            line = line_queue.get(timeout=1.0)
+        except queue.Empty:
+            if proc.poll() is not None:
+                # Drain any remaining lines after process exit
+                while True:
+                    try:
+                        extra = line_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if extra is None:
+                        break
+                    extra = extra.strip()
+                    if extra.startswith("{"):
+                        findings.extend(_parse_nuclei_jsonl(extra, fqdn))
+                break
+            continue
+
+        if line is None:
+            break
+        line = line.strip()
+        if line.startswith("{"):
+            findings.extend(_parse_nuclei_jsonl(line, fqdn))
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    return findings, "".join(stderr_chunks)[:500], timed_out
 
 
 def _parse_nuclei_jsonl(stdout: str, default_target: str) -> list[dict]:
@@ -324,46 +419,21 @@ def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[d
         "-severity", "low,medium,high,critical",
         "-jsonl",
         "-silent",
+        "-ss", "template-spray",
         "-timeout", str(settings.nuclei_request_timeout),
-        "-rate-limit", "80",
+        "-rate-limit", "100",
         "-bulk-size", "25",
         "-concurrency", "25",
         "-max-host-error", "50",
         "-duc",
     ]
 
-    findings: list[dict] = []
-    deadline = time.monotonic() + settings.nuclei_subprocess_timeout
-
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+        findings, stderr, timed_out = _execute_nuclei(
+            cmd, fqdn, settings.nuclei_subprocess_timeout
         )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            if time.monotonic() > deadline:
-                logger.warning(
-                    f"[nuclei] subprocess timeout ({settings.nuclei_subprocess_timeout}s) "
-                    f"for {fqdn} — keeping {len(findings)} findings so far"
-                )
-                proc.kill()
-                break
-            line = line.strip()
-            if line.startswith("{"):
-                findings.extend(_parse_nuclei_jsonl(line, fqdn))
-
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-        stderr = (proc.stderr.read() if proc.stderr else "") or ""
-        if proc.returncode not in (0, None) and not findings and stderr:
-            logger.warning(f"[nuclei] exit={proc.returncode} no findings; stderr={stderr[:500]!r}")
+        if stderr and not findings:
+            logger.warning(f"[nuclei] stderr: {stderr[:500]!r}")
         elif stderr:
             logger.info(f"[nuclei] stderr: {stderr[:300]}")
 

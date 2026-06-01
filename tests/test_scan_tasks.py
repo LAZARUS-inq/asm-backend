@@ -44,13 +44,27 @@ def test_nuclei_template_args_tags_mode(monkeypatch):
     from app.core.config import settings
 
     monkeypatch.setattr(settings, "nuclei_scan_mode", "tags")
-    monkeypatch.setattr(settings, "nuclei_scan_tags", "cve,vuln")
+    monkeypatch.setattr(settings, "nuclei_scan_tags", "sqli,xss")
     monkeypatch.setattr(
         "app.tasks.scan_tasks._nuclei_templates_root",
         lambda: "/nuclei-templates",
     )
+    monkeypatch.setattr(
+        "app.tasks.scan_tasks.NUCLEI_TAGS_ROOT",
+        "/nuclei-templates/http/vulnerabilities",
+    )
+    monkeypatch.setattr(
+        "app.tasks.scan_tasks.os.path.isdir",
+        lambda path: path in (
+            "/nuclei-templates",
+            "/nuclei-templates/http/vulnerabilities",
+        ),
+    )
     from app.tasks.scan_tasks import _nuclei_template_args
 
     assert _nuclei_template_args() == [
-        "-t", "/nuclei-templates", "-tags", "cve,vuln",
+        "-t",
+        "/nuclei-templates/http/vulnerabilities",
+        "-tags",
+        "sqli,xss",
     ]

@@ -40,9 +40,9 @@ class Settings(BaseSettings):
     nuclei_request_timeout: int = 15
     scan_task_soft_time_limit: int = 1200
     scan_task_time_limit: int = 1260
-    # "tags" = faster (recommended on Railway); "dirs" = scan template directories
+    # "tags" = filter within NUCLEI_TAGS_ROOT; "dirs" = two web-vuln dirs
     nuclei_scan_mode: str = "tags"
-    nuclei_scan_tags: str = "cve,vuln,exposure,misconfig"
+    nuclei_scan_tags: str = "sqli,xss,lfi,exposure,misconfig"
     # When nmap finds nothing: "http" (faster) or "both" (http+https)
     nuclei_fallback_targets: str = "http"
 
