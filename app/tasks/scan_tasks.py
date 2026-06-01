@@ -35,8 +35,12 @@ NUCLEI_SCAN_DIRS = [
     "/nuclei-templates/http/exposures",
 ]
 
-# Narrow root for tags mode — do not scan all 13k templates
-NUCLEI_TAGS_ROOT = "/nuclei-templates/http/vulnerabilities"
+# Smaller dirs for tags mode (whole http/vulnerabilities is thousands of templates)
+NUCLEI_TAG_DIRS = [
+    "/nuclei-templates/http/vulnerabilities/generic",
+    "/nuclei-templates/http/exposures",
+    "/nuclei-templates/http/misconfiguration",
+]
 
 
 def utcnow():
@@ -126,18 +130,17 @@ def _unreachable_finding(fqdn: str, urls: list[str], errors: list[str]) -> dict:
     }
 
 
-def _count_templates_for_scan(template_args: list[str]) -> int | None:
-    try:
-        result = subprocess.run(
-            ["nuclei", "-tl", "-silent", *template_args],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        return len([ln for ln in result.stdout.splitlines() if ln.strip()])
-    except Exception as e:
-        logger.warning(f"[nuclei] could not list templates: {e}")
-        return None
+def _pick_primary_scan_url(reachable_urls: list[str]) -> list[str]:
+    """One URL per scan — http+https doubles runtime with little benefit."""
+    if not reachable_urls:
+        return []
+    if len(reachable_urls) == 1:
+        return reachable_urls
+    https = [u for u in reachable_urls if u.startswith("https://")]
+    if https:
+        logger.info(f"[nuclei] both schemes reachable — using {https[0]} only")
+        return [https[0]]
+    return [reachable_urls[0]]
 
 
 def _probe_tcp_ports(fqdn: str, ports: tuple[int, ...] = (80, 443)) -> set[int]:
@@ -210,9 +213,15 @@ def _nuclei_template_args() -> list[str]:
     mode = settings.nuclei_scan_mode.strip().lower()
     if mode == "tags":
         tags = settings.nuclei_scan_tags.strip()
-        tag_root = NUCLEI_TAGS_ROOT if os.path.isdir(NUCLEI_TAGS_ROOT) else root
         if tags:
-            return ["-t", tag_root, "-tags", tags]
+            tag_dirs = [d for d in NUCLEI_TAG_DIRS if os.path.isdir(d)]
+            if not tag_dirs:
+                tag_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)] or [root]
+            args: list[str] = []
+            for d in tag_dirs:
+                args += ["-t", d]
+            args += ["-tags", tags]
+            return args
 
     scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
     if not scan_dirs:
@@ -463,31 +472,21 @@ def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[d
         logger.error(f"[nuclei] skipping scan — {fqdn} unreachable from this host")
         return [_unreachable_finding(fqdn, target_urls, probe_errors)]
 
+    scan_urls = _pick_primary_scan_url(reachable_urls)
+    tag_dirs = [template_args[i + 1] for i, a in enumerate(template_args) if a == "-t"]
+
     logger.info(
-        f"[nuclei] scanning {fqdn} targets={reachable_urls} "
+        f"[nuclei] scanning {fqdn} targets={scan_urls} "
         f"mode={settings.nuclei_scan_mode!r} tags={settings.nuclei_scan_tags!r} "
-        f"template_args={template_args!r}"
+        f"template_dirs={tag_dirs!r}"
     )
 
     if not template_args:
         logger.warning("[nuclei] no templates — run: nuclei -update-templates -ud /nuclei-templates")
         return []
 
-    tpl_count = _count_templates_for_scan(template_args)
-    if tpl_count is not None:
-        logger.info(f"[nuclei] {tpl_count} templates selected for this scan")
-        if tpl_count > 800:
-            logger.warning(
-                f"[nuclei] {tpl_count} templates is large — set NUCLEI_SCAN_TAGS=sqli,xss,lfi,exposure"
-            )
-    elif _nuclei_templates_root():
-        logger.info(
-            f"[nuclei] template root {_nuclei_templates_root()} "
-            f"({_count_nuclei_templates(_nuclei_templates_root())} yaml files total)"
-        )
-
     cmd: list[str] = ["nuclei"]
-    for url in reachable_urls:
+    for url in scan_urls:
         cmd += ["-u", url]
     cmd += template_args
     cmd += [

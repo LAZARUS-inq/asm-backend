@@ -84,22 +84,31 @@ def test_nuclei_template_args_tags_mode(monkeypatch):
         "app.tasks.scan_tasks._nuclei_templates_root",
         lambda: "/nuclei-templates",
     )
-    monkeypatch.setattr(
-        "app.tasks.scan_tasks.NUCLEI_TAGS_ROOT",
-        "/nuclei-templates/http/vulnerabilities",
-    )
+    valid = {
+        "/nuclei-templates",
+        "/nuclei-templates/http/vulnerabilities/generic",
+        "/nuclei-templates/http/exposures",
+        "/nuclei-templates/http/misconfiguration",
+    }
     monkeypatch.setattr(
         "app.tasks.scan_tasks.os.path.isdir",
-        lambda path: path in (
-            "/nuclei-templates",
-            "/nuclei-templates/http/vulnerabilities",
-        ),
+        lambda path: path in valid,
     )
     from app.tasks.scan_tasks import _nuclei_template_args
 
     assert _nuclei_template_args() == [
-        "-t",
-        "/nuclei-templates/http/vulnerabilities",
-        "-tags",
-        "sqli,xss",
+        "-t", "/nuclei-templates/http/vulnerabilities/generic",
+        "-t", "/nuclei-templates/http/exposures",
+        "-t", "/nuclei-templates/http/misconfiguration",
+        "-tags", "sqli,xss",
     ]
+
+
+def test_pick_primary_scan_url_prefers_https():
+    from app.tasks.scan_tasks import _pick_primary_scan_url
+
+    urls = _pick_primary_scan_url([
+        "http://example.com",
+        "https://example.com",
+    ])
+    assert urls == ["https://example.com"]
