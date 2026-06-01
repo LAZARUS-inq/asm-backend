@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # Shodan
     shodan_api_key: str = ""
 
+    # Scanners (seconds)
+    nuclei_subprocess_timeout: int = 600
+    nuclei_request_timeout: int = 15
+    scan_task_soft_time_limit: int = 1200
+    scan_task_time_limit: int = 1260
+
     # App
     environment: str = "development"
     allowed_origins: str = "http://localhost:5173"

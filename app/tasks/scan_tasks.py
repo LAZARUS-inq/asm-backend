@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from celery import shared_task
 from celery.utils.log import get_task_logger
 
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.models import Domain, Finding, ScanJob, ScanStatus, Severity
 
@@ -22,11 +23,12 @@ logger = get_task_logger(__name__)
 
 NUCLEI_TEMPLATES = "/nuclei-templates"
 
-# Only scan these dirs — much faster than all templates
+# Subset of templates — faster than scanning all of /nuclei-templates
 NUCLEI_SCAN_DIRS = [
     "/nuclei-templates/http/vulnerabilities",
     "/nuclei-templates/http/exposures",
     "/nuclei-templates/http/misconfiguration",
+    "/nuclei-templates/http/cves",
 ]
 
 
@@ -69,6 +71,67 @@ def _save_findings(db, scan_job_id: str, results: list[dict]) -> None:
         )
         db.add(finding)
     db.commit()
+
+
+def _nuclei_target_urls(fqdn: str, port_findings: list[dict] | None = None) -> list[str]:
+    """Build nuclei -u targets from open ports; avoid HTTPS-only when only HTTP serves."""
+    ports: set[int] = set()
+    if port_findings:
+        for f in port_findings:
+            p = f.get("port")
+            if isinstance(p, int):
+                ports.add(p)
+
+    urls: list[str] = []
+    if not ports or 80 in ports:
+        urls.append(f"http://{fqdn}")
+    if not ports or 443 in ports:
+        urls.append(f"https://{fqdn}")
+
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return ordered
+
+
+def _parse_nuclei_jsonl(stdout: str, default_target: str) -> list[dict]:
+    findings: list[dict] = []
+    for line in stdout.strip().splitlines():
+        if not line or not line.lstrip().startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        info = data.get("info") or {}
+        severity = str(info.get("severity", "info")).lower()
+        name = info.get("name", "Unknown")
+        matched_at = data.get("matched-at") or data.get("host") or default_target
+        description = info.get("description", "")
+
+        cve_id = ""
+        classification = info.get("classification") or {}
+        raw_cve = classification.get("cve-id")
+        if isinstance(raw_cve, list) and raw_cve:
+            cve_id = str(raw_cve[0])
+        elif isinstance(raw_cve, str) and raw_cve:
+            cve_id = raw_cve
+
+        findings.append({
+            "finding_type": "vuln",
+            "target": matched_at,
+            "severity": severity,
+            "title": name,
+            "description": description,
+            "cve_id": cve_id,
+            "raw_output": line[:1000],
+        })
+    return findings
 
 
 def _run_subdomain_scan(fqdn: str) -> list[dict]:
@@ -171,10 +234,10 @@ def _run_port_scan(fqdn: str) -> list[dict]:
         return []
 
 
-def _run_vuln_scan(fqdn: str) -> list[dict]:
-    logger.info(f"[nuclei] scanning {fqdn}")
+def _run_vuln_scan(fqdn: str, port_findings: list[dict] | None = None) -> list[dict]:
+    target_urls = _nuclei_target_urls(fqdn, port_findings)
+    logger.info(f"[nuclei] scanning {fqdn} targets={target_urls}")
 
-    # Use specific dirs if they exist, else fall back to full templates
     scan_dirs = [d for d in NUCLEI_SCAN_DIRS if os.path.isdir(d)]
     if not scan_dirs and os.path.isdir(NUCLEI_TEMPLATES):
         scan_dirs = [NUCLEI_TEMPLATES]
@@ -182,57 +245,48 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
     if scan_dirs:
         logger.info(f"[nuclei] using {len(scan_dirs)} template dirs")
     else:
-        logger.warning("[nuclei] no templates found, nuclei will try to download")
+        logger.warning("[nuclei] no templates found — install /nuclei-templates in the image")
 
-    cmd = ["nuclei", "-u", f"https://{fqdn}"]
-
+    cmd: list[str] = ["nuclei"]
+    for url in target_urls:
+        cmd += ["-u", url]
     for d in scan_dirs:
         cmd += ["-t", d]
 
     cmd += [
         "-severity", "low,medium,high,critical",
-        "-json-export", "-",
+        "-jsonl",  # JSON Lines on stdout (required for parsing)
         "-silent",
-        "-timeout", "10",
+        "-timeout", str(settings.nuclei_request_timeout),
         "-rate-limit", "50",
         "-bulk-size", "25",
         "-concurrency", "25",
+        "-max-host-error", "50",
         "-duc",
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        findings = []
-        for line in result.stdout.strip().splitlines():
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                severity = data.get("info", {}).get("severity", "info").lower()
-                name = data.get("info", {}).get("name", "Unknown")
-                matched_at = data.get("matched-at", fqdn)
-                description = data.get("info", {}).get("description", "")
-                cve_id = ""
-                for tag in data.get("info", {}).get("classification", {}).get("cve-id", []):
-                    cve_id = tag
-                    break
-                findings.append({
-                    "finding_type": "vuln",
-                    "target": matched_at,
-                    "severity": severity,
-                    "title": name,
-                    "description": description,
-                    "cve_id": cve_id,
-                    "raw_output": line[:1000],
-                })
-            except json.JSONDecodeError:
-                continue
-        logger.info(f"[nuclei] found {len(findings)} vulns for {fqdn}")
-        if result.stderr:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=settings.nuclei_subprocess_timeout,
+        )
+        findings = _parse_nuclei_jsonl(result.stdout, fqdn)
+
+        if result.returncode not in (0, None) and not findings:
+            logger.warning(
+                f"[nuclei] exit={result.returncode} no findings; stderr={result.stderr[:500]!r}"
+            )
+        elif result.stderr:
             logger.info(f"[nuclei] stderr: {result.stderr[:300]}")
+
+        logger.info(f"[nuclei] found {len(findings)} vulns for {fqdn}")
         return findings
     except subprocess.TimeoutExpired:
-        logger.warning(f"[nuclei] timeout for {fqdn}")
+        logger.warning(
+            f"[nuclei] subprocess timeout ({settings.nuclei_subprocess_timeout}s) for {fqdn}"
+        )
         return []
     except FileNotFoundError:
         logger.error("[nuclei] not installed or not in PATH")
@@ -242,7 +296,13 @@ def _run_vuln_scan(fqdn: str) -> list[dict]:
         return []
 
 
-@shared_task(bind=True, name="app.tasks.scan_tasks.run_full_scan", max_retries=2)
+@shared_task(
+    bind=True,
+    name="app.tasks.scan_tasks.run_full_scan",
+    max_retries=2,
+    soft_time_limit=settings.scan_task_soft_time_limit,
+    time_limit=settings.scan_task_time_limit,
+)
 def run_full_scan(self, domain_id: str) -> dict:
     db = SessionLocal()
     try:
@@ -268,7 +328,7 @@ def run_full_scan(self, domain_id: str) -> dict:
             ports = _run_port_scan(domain.fqdn)
             _save_findings(db, str(job.id), ports)
 
-            vulns = _run_vuln_scan(domain.fqdn)
+            vulns = _run_vuln_scan(domain.fqdn, ports)
             _save_findings(db, str(job.id), vulns)
 
             job.status = ScanStatus.completed
