@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     # NowPayments
     nowpayments_api_key: str = ""
     nowpayments_wallet: str = ""
+    nowpayments_ipn_secret: str = ""
+    plan_subscription_days: int = 30
     api_base_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:5173"
 

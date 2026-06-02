@@ -4,18 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_current_user
+from app.core.plans import domain_limit, effective_plan, scan_interval_hours
 from app.db.session import get_db
 from app.models.models import Domain, Finding, PlanTier, ScanJob, ScanStatus, User, Workspace
 from app.schemas.schemas import DomainCreate, DomainResponse, ScanStatusResponse
+from app.services.plan_service import refresh_user_plan
 from app.tasks.scan_tasks import run_full_scan
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/domains", tags=["domains"])
-
-PLAN_DOMAIN_LIMITS = {
-    PlanTier.free: 1,
-    PlanTier.starter: 5,
-    PlanTier.pro: 25,
-}
 
 
 def _parse_uuid(val: str) -> uuid.UUID:
@@ -43,9 +39,12 @@ def add_domain(
     current_user: User = Depends(get_current_user),
 ):
     ws = _get_workspace(workspace_id, current_user, db)
+    refresh_user_plan(current_user, db)
+    db.refresh(current_user)
 
     existing_count = db.query(Domain).filter(Domain.workspace_id == ws.id).count()
-    limit = PLAN_DOMAIN_LIMITS[current_user.plan]
+    plan = effective_plan(current_user)
+    limit = domain_limit(plan)
     if existing_count >= limit:
         raise HTTPException(
             status_code=402,
@@ -55,7 +54,11 @@ def add_domain(
     if db.query(Domain).filter(Domain.workspace_id == ws.id, Domain.fqdn == payload.fqdn).first():
         raise HTTPException(status_code=400, detail="Domain already exists in this workspace")
 
-    domain = Domain(workspace_id=ws.id, **payload.model_dump())
+    domain = Domain(
+        workspace_id=ws.id,
+        fqdn=payload.fqdn,
+        scan_interval_hours=scan_interval_hours(plan),
+    )
     db.add(domain)
     db.commit()
     db.refresh(domain)

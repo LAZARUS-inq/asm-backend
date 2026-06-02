@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.security import decode_token, oauth2_scheme
 from app.db.session import get_db
 from app.models.models import User
+from app.services.plan_service import refresh_user_plan
 
 
 def get_current_user(
@@ -25,4 +26,7 @@ def get_current_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+
+    refresh_user_plan(user, db)
+    db.refresh(user)
     return user

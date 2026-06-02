@@ -47,10 +47,38 @@ class UserResponse(BaseModel):
     email: str
     full_name: str
     plan: PlanTier
+    plan_expires_at: Optional[datetime] = None
     is_active: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PlanInfoResponse(BaseModel):
+    id: str
+    name: str
+    price: int
+    domains: int
+    scan_interval: str
+    scan_interval_hours: int
+    features: list[str]
+
+
+class BillingPlansResponse(BaseModel):
+    current_plan: PlanTier
+    effective_plan: PlanTier
+    plan_expires_at: Optional[datetime] = None
+    days_remaining: Optional[int] = None
+    domain_limit: int
+    scan_interval_hours: int
+    plans: list[PlanInfoResponse]
+
+
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+    payment_id: str | int | None = None
+    plan: str
+    amount_usd: int
 
 
 # ──────────────────────────────────────────────
@@ -75,7 +103,6 @@ class WorkspaceResponse(BaseModel):
 
 class DomainCreate(BaseModel):
     fqdn: str
-    scan_interval_hours: int = 24
 
     @field_validator("fqdn")
     @classmethod

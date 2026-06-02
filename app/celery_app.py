@@ -7,7 +7,7 @@ celery_app = Celery(
     "asm",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.scan_tasks"],
+    include=["app.tasks.scan_tasks", "app.tasks.billing_tasks"],
 )
 
 celery_app.conf.update(
@@ -27,5 +27,9 @@ celery_app.conf.beat_schedule = {
     "schedule-due-scans": {
         "task": "app.tasks.scan_tasks.schedule_due_scans",
         "schedule": crontab(minute="*/10"),
+    },
+    "expire-due-plans": {
+        "task": "app.tasks.billing_tasks.expire_due_plans",
+        "schedule": crontab(hour=3, minute=0),
     },
 }
