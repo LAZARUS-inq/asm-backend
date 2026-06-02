@@ -17,11 +17,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "users",
-        sa.Column("plan_expires_at", sa.DateTime(timezone=True), nullable=True),
+    # Idempotent — column may already exist if added manually on Railway.
+    op.execute(
+        sa.text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+            "plan_expires_at TIMESTAMP WITH TIME ZONE"
+        )
     )
 
 
 def downgrade() -> None:
-    op.drop_column("users", "plan_expires_at")
+    op.execute(
+        sa.text("ALTER TABLE users DROP COLUMN IF EXISTS plan_expires_at")
+    )
