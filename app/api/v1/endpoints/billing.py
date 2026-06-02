@@ -98,6 +98,15 @@ def get_plans(
     return _billing_plans_response(current_user)
 
 
+@router.get("/webhook")
+def webhook_health():
+    """Browser GET returns OK; NOWPayments sends POST with payment payload."""
+    return {
+        "status": "ok",
+        "message": "NOWPayments IPN endpoint. Payments are processed via POST only.",
+    }
+
+
 @router.post("/webhook")
 async def nowpayments_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.json()
